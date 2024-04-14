@@ -1,6 +1,7 @@
 package uhc
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -113,17 +114,17 @@ func (u *UtlsHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		dialConn, err = proxy.FromEnvironment().Dial("tcp", fmt.Sprintf("%s:%s", req.URL.Hostname(), port))
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial failed: %w", err)
 	}
 	uTlsConn := utls.UClient(dialConn, &config, utls.HelloChrome_Auto)
 	err = uTlsConn.HandshakeContext(u.Ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("utls handshake failed: %w", err)
 	}
-	resp, err := httpGetOverConn(u.Base, req, uTlsConn, uTlsConn.ConnectionState().NegotiatedProtocol)
+	resp, err := doHttpOverConn(u.Base, req, uTlsConn, uTlsConn.ConnectionState().NegotiatedProtocol)
 	if err != nil {
 		_ = uTlsConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("do http over conn failed: %w", err)
 	}
 	resp.Body = &utlsHttpBody{uTlsConn, resp.Body}
 	return resp, nil
@@ -167,49 +168,31 @@ func getH2RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, 
 	}
 }
 
-func getH1_1RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, error) {
-	if rt != nil {
-		tr, ok := rt.(*http.Transport)
-		if !ok {
-			return nil, fmt.Errorf("unsupported RoundTripper: %T", rt)
-		}
-		tr = tr.Clone()
-		tr.MaxResponseHeaderBytes = 262144
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return conn, nil
-		}
-		return tr, nil
-	} else {
-		tr := (http.DefaultTransport).(*http.Transport).Clone()
-		tr.MaxResponseHeaderBytes = 262144
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return conn, nil
-		}
-		return tr, nil
-	}
-}
-
-func httpGetOverConn(rt http.RoundTripper, req *http.Request, conn net.Conn, alpn string) (*http.Response, error) {
-	var err error
+func doHttpOverConn(rt http.RoundTripper, req *http.Request, conn net.Conn, alpn string) (*http.Response, error) {
 	switch alpn {
 	case "h2":
 		req.Proto = "HTTP/2.0"
 		req.ProtoMajor = 2
 		req.ProtoMinor = 0
-		rt, err = getH2RoundTripper(rt, conn)
+		rt, err := getH2RoundTripper(rt, conn)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get http/2 round tripper failed: %w", err)
 		}
+		resp, err := rt.RoundTrip(req)
+		if err != nil {
+			return nil, fmt.Errorf("do http/2 request failed: %w", err)
+		}
+		return resp, nil
 	case "http/1.1", "":
 		req.Proto = "HTTP/1.1"
 		req.ProtoMajor = 1
 		req.ProtoMinor = 1
-		rt, err = getH1_1RoundTripper(rt, conn)
+		err := req.Write(conn)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get http/1.1 round tripper failed: %w", err)
 		}
+		return http.ReadResponse(bufio.NewReader(conn), req)
 	default:
 		return nil, fmt.Errorf("unsupported ALPN: %v", alpn)
 	}
-	return rt.RoundTrip(req)
 }
