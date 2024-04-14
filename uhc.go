@@ -1,4 +1,4 @@
-package utc
+package uhc
 
 import (
 	"context"
@@ -6,10 +6,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 var _ io.ReadCloser = (*utlsHttpBody)(nil)
@@ -61,18 +63,23 @@ func NewUtlsHttpRoundTripper(opts ...UtlsHttpOption) *UtlsHttpRoundTripper {
 	return rt
 }
 
-func UtlsDo(req *http.Request) (*http.Response, error) {
-	return DefaultUtlsHttpRoundTripper.RoundTrip(req)
+func Do(req *http.Request) (*http.Response, error) {
+	return DefaultUtlsHttpRoundTripper.Do(req)
 }
 
-func UtlsDoWithOptions(req *http.Request, opts ...UtlsHttpOption) (*http.Response, error) {
-	return NewUtlsHttpRoundTripper(opts...).RoundTrip(req)
+func DoWithOptions(req *http.Request, opts ...UtlsHttpOption) (*http.Response, error) {
+	return NewUtlsHttpRoundTripper(opts...).Do(req)
 }
 
 type UtlsHttpRoundTripper struct {
-	Base    http.RoundTripper
-	Ctx     context.Context
-	Timeout time.Duration
+	Base        http.RoundTripper
+	Ctx         context.Context
+	Timeout     time.Duration
+	ProxySocks5 *url.URL
+}
+
+func (u *UtlsHttpRoundTripper) Do(req *http.Request) (*http.Response, error) {
+	return u.RoundTrip(req)
 }
 
 func (u *UtlsHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -81,6 +88,7 @@ func (u *UtlsHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	}
 
 	config := utls.Config{ServerName: req.URL.Hostname()}
+
 	port := req.URL.Port()
 	if port == "" {
 		switch req.URL.Scheme {
@@ -90,7 +98,20 @@ func (u *UtlsHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 			port = "80"
 		}
 	}
-	dialConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", req.URL.Hostname(), port), u.Timeout)
+	var (
+		dialConn net.Conn
+		err      error
+	)
+	if u.ProxySocks5 != nil {
+		var d proxy.Dialer
+		d, err = proxy.FromURL(u.ProxySocks5, proxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+		dialConn, err = d.Dial("tcp", fmt.Sprintf("%s:%s", req.URL.Hostname(), port))
+	} else {
+		dialConn, err = proxy.FromEnvironment().Dial("tcp", fmt.Sprintf("%s:%s", req.URL.Hostname(), port))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +132,7 @@ func (u *UtlsHttpRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 func getH2RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, error) {
 	if rt != nil {
 		tr, ok := rt.(*http.Transport)
-		if !ok {
+		if ok {
 			tr = tr.Clone()
 			tr.MaxResponseHeaderBytes = 262144
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -125,14 +146,14 @@ func getH2RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, 
 			if err != nil {
 				return nil, err
 			}
-			rt = c
+			return c, nil
 		} else if h2tr, ok := rt.(*http2.Transport); ok {
 			h2tr.MaxHeaderListSize = 262144
 			c, err := h2tr.NewClientConn(conn)
 			if err != nil {
 				return nil, err
 			}
-			rt = c
+			return c, nil
 		} else {
 			return nil, fmt.Errorf("unsupported RoundTripper: %T", rt)
 		}
@@ -142,9 +163,8 @@ func getH2RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, 
 		if err != nil {
 			return nil, err
 		}
-		rt = c
+		return c, nil
 	}
-	return rt, nil
 }
 
 func getH1_1RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, error) {
@@ -158,16 +178,15 @@ func getH1_1RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return conn, nil
 		}
-		rt = tr
+		return tr, nil
 	} else {
 		tr := (http.DefaultTransport).(*http.Transport).Clone()
 		tr.MaxResponseHeaderBytes = 262144
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return conn, nil
 		}
-		rt = tr
+		return tr, nil
 	}
-	return rt, nil
 }
 
 func httpGetOverConn(rt http.RoundTripper, req *http.Request, conn net.Conn, alpn string) (*http.Response, error) {
