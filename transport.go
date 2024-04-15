@@ -87,7 +87,7 @@ func (u *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		defer cancel()
 	}
 	clientHelloID := u.ClientHelloID
-	if !clientHelloID.IsSet() {
+	if clientHelloID.IsSet() {
 		clientHelloID = defaultClientHelloID
 	}
 
