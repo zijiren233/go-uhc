@@ -2,7 +2,6 @@ package uhc_test
 
 import (
 	"net/http"
-	"net/http/httputil"
 	"testing"
 
 	"github.com/zijiren233/go-uhc"
@@ -17,9 +16,18 @@ func TestOpenAI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	data, err := httputil.DumpResponse(resp, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", resp.StatusCode)
+	}
+	t.Logf("uhc status code: %d", resp.StatusCode)
+
+	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log(string(data))
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("unexpected status code: %d", resp2.StatusCode)
+	}
+	t.Logf("http default client status code: %d", resp2.StatusCode)
 }
