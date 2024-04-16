@@ -77,9 +77,23 @@ func (u *utlsHttpBody) Close() error {
 
 var (
 	defaultClientHelloID = utls.HelloChrome_Auto
+	defaultHttpTransport http.RoundTripper
 )
 
+func init() {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxResponseHeaderBytes = 262144
+	defaultHttpTransport = transport
+}
+
 func (u *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "http" {
+		return getHttpRoundTripper(u.Base).RoundTrip(req)
+	}
+	if req.URL.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme: %s", req.URL.Scheme)
+	}
+
 	ctx := req.Context()
 	if u.Timeout != 0 {
 		var cancel context.CancelFunc
@@ -142,6 +156,20 @@ func (u *Transport) dialContext(ctx context.Context, network string, address str
 		}
 	} else {
 		return proxy.Dial(ctx, network, address)
+	}
+}
+
+func getHttpRoundTripper(rt http.RoundTripper) http.RoundTripper {
+	if rt != nil {
+		tr, ok := rt.(*http.Transport)
+		if !ok {
+			return rt
+		}
+		tr = tr.Clone()
+		tr.MaxResponseHeaderBytes = 262144
+		return tr
+	} else {
+		return defaultHttpTransport
 	}
 }
 
