@@ -77,13 +77,11 @@ func (u *utlsHttpBody) Close() error {
 
 var (
 	defaultClientHelloID = utls.HelloChrome_Auto
-	defaultHttpTransport http.RoundTripper
+	defaultHttpTransport = http.DefaultTransport.(*http.Transport).Clone()
 )
 
 func init() {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxResponseHeaderBytes = 262144
-	defaultHttpTransport = transport
+	defaultHttpTransport.MaxResponseHeaderBytes = 262144
 }
 
 func (u *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
