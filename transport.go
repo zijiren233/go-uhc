@@ -20,53 +20,60 @@ var DefaultTransport http.RoundTripper = &Transport{}
 type TransportOption func(*Transport)
 
 func WithTimeout(timeout time.Duration) TransportOption {
-	return func(options *Transport) {
-		options.Timeout = timeout
+	return func(t *Transport) {
+		t.Timeout = timeout
 	}
 }
 
 func WithBaseRoundTripper(base http.RoundTripper) TransportOption {
-	return func(options *Transport) {
-		options.Base = base
+	return func(t *Transport) {
+		switch base := base.(type) {
+		case *http.Transport:
+			t.httpTransport = base.Clone()
+		case *http2.Transport:
+			base.MaxHeaderListSize = maxHeaderListSize
+			t.h2Transport = base
+		}
 	}
 }
 
 func WithClientHelloID(clientHelloID utls.ClientHelloID) TransportOption {
-	return func(options *Transport) {
-		options.ClientHelloID = clientHelloID
+	return func(t *Transport) {
+		t.ClientHelloID = clientHelloID
 	}
 }
 
 func WithInsecureSkipVerify(insecureSkipVerify bool) TransportOption {
-	return func(options *Transport) {
-		options.InsecureSkipVerify = insecureSkipVerify
+	return func(t *Transport) {
+		t.InsecureSkipVerify = insecureSkipVerify
 	}
 }
 
 func NewTransport(opts ...TransportOption) *Transport {
-	rt := &Transport{}
+	t := &Transport{}
 	for _, opt := range opts {
-		opt(rt)
+		opt(t)
 	}
-	return rt
+	return t
 }
 
 type Transport struct {
-	Base               http.RoundTripper
 	ClientHelloID      utls.ClientHelloID
-	InsecureSkipVerify bool
-	Timeout            time.Duration
+	httpTransport      *http.Transport
+	h2Transport        *http2.Transport
 	ProxySocks5        *url.URL
+	Timeout            time.Duration
+	InsecureSkipVerify bool
 }
-
-var _ io.ReadCloser = (*utlsHttpBody)(nil)
 
 type utlsHttpBody struct {
 	conn    *utls.UConn
 	rawBody io.ReadCloser
 }
 
-func (u *utlsHttpBody) Read(p []byte) (n int, err error) {
+var _ io.ReadCloser = (*utlsHttpBody)(nil)
+
+func (u *utlsHttpBody) Read(p []byte) (int, error) {
 	return u.rawBody.Read(p)
 }
 
@@ -75,164 +82,135 @@ func (u *utlsHttpBody) Close() error {
 	return u.rawBody.Close()
 }
 
+const maxHeaderListSize = 262144
+
 var (
 	defaultClientHelloID = utls.HelloChrome_Auto
 	defaultHttpTransport = http.DefaultTransport.(*http.Transport).Clone()
+	defaultH2Transport   = &http2.Transport{MaxHeaderListSize: maxHeaderListSize}
 )
 
 func init() {
-	defaultHttpTransport.MaxResponseHeaderBytes = 262144
+	defaultHttpTransport.MaxResponseHeaderBytes = maxHeaderListSize
 }
 
-func (u *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "http" {
-		return getHttpRoundTripper(u.Base).RoundTrip(req)
+		return getHttpRoundTripper(t.httpTransport).RoundTrip(req)
 	}
 	if req.URL.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported scheme: %s", req.URL.Scheme)
 	}
 
 	ctx := req.Context()
-	if u.Timeout != 0 {
+	if t.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, u.Timeout)
+		ctx, cancel = context.WithTimeout(ctx, t.Timeout)
 		defer cancel()
 	}
-	clientHelloID := u.ClientHelloID
+
+	clientHelloID := t.ClientHelloID
 	if clientHelloID.IsSet() {
 		clientHelloID = defaultClientHelloID
 	}
 
 	address := net.JoinHostPort(req.URL.Hostname(), getRequestPort(req))
-	conn, err := u.dialContext(ctx, "tcp", address)
+	conn, err := t.dialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s failed: %w", address, err)
 	}
 
-	config := utls.Config{
+	config := &utls.Config{
 		ServerName:         req.URL.Hostname(),
-		InsecureSkipVerify: u.InsecureSkipVerify,
+		InsecureSkipVerify: t.InsecureSkipVerify,
 	}
-	uTlsConn := utls.UClient(conn, &config, clientHelloID)
-	err = uTlsConn.HandshakeContext(ctx)
-	if err != nil {
+	uTlsConn := utls.UClient(conn, config, clientHelloID)
+	if err := uTlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("utls handshake failed: %w", err)
 	}
 
-	resp, err := doHttpOverConn(u.Base, req, uTlsConn, uTlsConn.ConnectionState().NegotiatedProtocol)
+	resp, err := doHttpOverConn(t.h2Transport, req, uTlsConn, uTlsConn.ConnectionState().NegotiatedProtocol)
 	if err != nil {
-		_ = uTlsConn.Close()
+		uTlsConn.Close()
 		return nil, fmt.Errorf("do http over conn failed: %w", err)
 	}
-	resp.Body = &utlsHttpBody{uTlsConn, resp.Body}
+
+	resp.Body = &utlsHttpBody{conn: uTlsConn, rawBody: resp.Body}
 	return resp, nil
 }
 
 func getRequestPort(req *http.Request) string {
-	port := req.URL.Port()
-	if port == "" {
-		switch req.URL.Scheme {
-		case "https":
-			port = "443"
-		default:
-			port = "80"
-		}
+	if port := req.URL.Port(); port != "" {
+		return port
 	}
-	return port
+	if req.URL.Scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 
-func (u *Transport) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	if u.ProxySocks5 != nil {
-		d, err := proxy.FromURL(u.ProxySocks5, proxy.Direct)
-		if err != nil {
-			return nil, err
-		}
-		if f, ok := d.(proxy.ContextDialer); ok {
-			return f.DialContext(ctx, network, address)
-		} else {
-			return d.Dial(network, address)
-		}
-	} else {
+func (t *Transport) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if t.ProxySocks5 == nil {
 		return proxy.Dial(ctx, network, address)
 	}
+
+	dialer, err := proxy.FromURL(t.ProxySocks5, proxy.Direct)
+	if err != nil {
+		return nil, err
+	}
+
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, address)
+	}
+	return dialer.Dial(network, address)
 }
 
-func getHttpRoundTripper(rt http.RoundTripper) http.RoundTripper {
-	if rt != nil {
-		tr, ok := rt.(*http.Transport)
-		if !ok {
-			return rt
-		}
-		tr = tr.Clone()
-		tr.MaxResponseHeaderBytes = 262144
-		return tr
-	} else {
+func getHttpRoundTripper(rt *http.Transport) http.RoundTripper {
+	if rt == nil {
 		return defaultHttpTransport
 	}
+
+	return rt
 }
 
-func getH2RoundTripper(rt http.RoundTripper, conn net.Conn) (http.RoundTripper, error) {
-	if rt != nil {
-		tr, ok := rt.(*http.Transport)
-		if ok {
-			tr = tr.Clone()
-			tr.MaxResponseHeaderBytes = 262144
-			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return conn, nil
-			}
-			h2transport, err := http2.ConfigureTransports(tr)
-			if err != nil {
-				return nil, err
-			}
-			c, err := h2transport.NewClientConn(conn)
-			if err != nil {
-				return nil, err
-			}
-			return c, nil
-		} else if h2tr, ok := rt.(*http2.Transport); ok {
-			h2tr.MaxHeaderListSize = 262144
-			c, err := h2tr.NewClientConn(conn)
-			if err != nil {
-				return nil, err
-			}
-			return c, nil
-		} else {
-			return nil, fmt.Errorf("unsupported RoundTripper: %T", rt)
-		}
-	} else {
-		tr := http2.Transport{MaxHeaderListSize: 262144}
-		c, err := tr.NewClientConn(conn)
-		if err != nil {
-			return nil, err
-		}
-		return c, nil
+func getH2RoundTripper(rt *http2.Transport, conn net.Conn) (http.RoundTripper, error) {
+	if rt == nil {
+		return defaultH2Transport.NewClientConn(conn)
 	}
+
+	rt.MaxHeaderListSize = maxHeaderListSize
+	return rt.NewClientConn(conn)
 }
 
-func doHttpOverConn(rt http.RoundTripper, req *http.Request, conn net.Conn, alpn string) (*http.Response, error) {
+func doHttpOverConn(rt *http2.Transport, req *http.Request, conn net.Conn, alpn string) (*http.Response, error) {
 	switch alpn {
 	case "h2":
 		req.Proto = "HTTP/2.0"
 		req.ProtoMajor = 2
 		req.ProtoMinor = 0
+
 		rt, err := getH2RoundTripper(rt, conn)
 		if err != nil {
 			return nil, fmt.Errorf("get http/2 round tripper failed: %w", err)
 		}
+
 		resp, err := rt.RoundTrip(req)
 		if err != nil {
 			return nil, fmt.Errorf("do http/2 request failed: %w", err)
 		}
 		return resp, nil
+
 	case "http/1.1", "":
 		req.Proto = "HTTP/1.1"
 		req.ProtoMajor = 1
 		req.ProtoMinor = 1
-		err := req.Write(conn)
-		if err != nil {
-			return nil, fmt.Errorf("get http/1.1 round tripper failed: %w", err)
+
+		if err := req.Write(conn); err != nil {
+			return nil, fmt.Errorf("write http/1.1 request failed: %w", err)
 		}
 		return http.ReadResponse(bufio.NewReader(conn), req)
+
 	default:
 		return nil, fmt.Errorf("unsupported ALPN: %v", alpn)
 	}
